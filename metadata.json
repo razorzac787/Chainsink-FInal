@@ -1,0 +1,6 @@
+{
+  "name": "ChainSink Forensics",
+  "description": "Automated Multi-Hop Blockchain Forensics, Heuristic Clustering, BlazingAML Pattern Mining & Optimistic STM Compliance Registry",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
