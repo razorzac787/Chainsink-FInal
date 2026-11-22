@@ -4,7 +4,7 @@
  * Includes hop-decay calculations, co-spending cluster details, and cryptographic Merkle proof verification.
  */
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   GraphNode,
   GraphEdge,
@@ -52,6 +52,10 @@ export const EntityInspector: React.FC<EntityInspectorProps> = ({
     valid: boolean;
     timestamp: number;
   } | null>(null);
+
+  useEffect(() => {
+    setVerificationResult(null);
+  }, [selectedNodeId]);
 
   const node = nodes.find((n) => n.id === selectedNodeId) || nodes[0];
   if (!node) {

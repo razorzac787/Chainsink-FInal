@@ -1,7 +1,8 @@
 /**
  * Interactive Forensics Network Canvas (ForensicsCanvas.tsx)
  * High-performance 2D force-directed physics graph visualizer for blockchain forensics.
- * Renders nodes, entity clusters, peel chains, cycle loops, and proximity gradients.
+ * Supports smooth 60fps pan/zoom, High-DPI responsive sizing, pointer-accurate node selection,
+ * node dragging, peel-chain/cycle overlays, and EAI proximity heatmaps.
  */
 
 import React, { useRef, useEffect, useState, useCallback } from 'react';
@@ -10,9 +11,8 @@ import {
   GraphEdge,
   PeelChain,
   TransactionCycle,
-  RiskCategory,
 } from '../types/forensics';
-import { ZoomIn, ZoomOut, RotateCcw, Eye, Layers, Compass, Zap } from 'lucide-react';
+import { ZoomIn, ZoomOut, RotateCcw, Eye, Layers, Compass, Zap, Maximize2 } from 'lucide-react';
 import { truncateAddress } from '../core/ingestion_wizard';
 
 interface ForensicsCanvasProps {
@@ -42,13 +42,24 @@ export const ForensicsCanvas: React.FC<ForensicsCanvasProps> = ({
   onSelectNode,
   currency = 'BTC',
 }) => {
+  const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  // Viewport Transform (Pan & Zoom)
-  const [transform, setTransform] = useState({ x: 0, y: 0, k: 1 });
-  const isDraggingRef = useRef(false);
-  const dragStartRef = useRef({ x: 0, y: 0 });
+  // Canvas logical CSS dimensions
+  const sizeRef = useRef({ width: 900, height: 600 });
+
+  // Imperative viewport transform for zero-lag 60fps pan & zoom
+  const transformRef = useRef({ x: 0, y: 0, k: 1 });
+  const [zoomPercent, setZoomPercent] = useState(100);
+
+  // Pointer interaction refs
+  const isPanningRef = useRef(false);
+  const panStartRef = useRef({ x: 0, y: 0 });
+  const pointerDownPosRef = useRef({ x: 0, y: 0 });
   const draggedNodeRef = useRef<SimNode | null>(null);
+  const hoveredNodeIdRef = useRef<string | null>(null);
+  const [hoveredNodeInfo, setHoveredNodeInfo] = useState<GraphNode | null>(null);
+  const [cursorStyle, setCursorStyle] = useState<'grab' | 'grabbing' | 'pointer'>('grab');
 
   // Visualization Overlays
   const [showPeelChains, setShowPeelChains] = useState(true);
@@ -56,34 +67,271 @@ export const ForensicsCanvas: React.FC<ForensicsCanvasProps> = ({
   const [showHeatmap, setShowHeatmap] = useState(false);
   const [groupByEntity, setGroupByEntity] = useState(false);
 
-  // Hovered Node
-  const [hoveredNode, setHoveredNode] = useState<SimNode | null>(null);
-
   // Simulation State
   const simNodesRef = useRef<SimNode[]>([]);
   const animFrameRef = useRef<number | null>(null);
 
-  // Initialize simulation positions
-  useEffect(() => {
-    const width = 1000;
-    const height = 650;
+  // Latest render options ref so physics/render callbacks never go stale or restart physics
+  const renderConfigRef = useRef({
+    edges,
+    selectedNodeId,
+    showPeelChains,
+    showCycles,
+    showHeatmap,
+    groupByEntity,
+    currency,
+  });
 
-    // Preserve existing positions if available, otherwise lay out in hierarchical or circular fashion
+  renderConfigRef.current = {
+    edges,
+    selectedNodeId,
+    showPeelChains,
+    showCycles,
+    showHeatmap,
+    groupByEntity,
+    currency,
+  };
+
+  function getNodeRadius(node: GraphNode): number {
+    if (node.isIllicitSeed) return 22;
+    const vol = Math.max(0.1, node.totalInflow + node.totalOutflow);
+    return Math.min(20, Math.max(13, 11 + Math.log10(vol + 1) * 3));
+  }
+
+  // Pure render function (does NOT mutate physics or restart simulation)
+  const renderCanvas = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const { width, height } = sizeRef.current;
+    const dpr = window.devicePixelRatio || 1;
+    const tf = transformRef.current;
+    const cfg = renderConfigRef.current;
+
+    ctx.save();
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, width, height);
+
+    // Draw background grid in screen/world space
+    ctx.save();
+    ctx.translate(tf.x, tf.y);
+    ctx.scale(tf.k, tf.k);
+
+    drawGrid(ctx, width, height, tf);
+
+    const nodeMap = new Map<string, SimNode>();
+    for (const sn of simNodesRef.current) nodeMap.set(sn.id, sn);
+
+    // Draw Entity Clusters Hull if toggled
+    if (cfg.groupByEntity) {
+      drawEntityHulls(ctx, simNodesRef.current);
+    }
+
+    // Draw Edges
+    for (const edge of cfg.edges) {
+      const src = nodeMap.get(edge.source);
+      const tgt = nodeMap.get(edge.target);
+      if (!src || !tgt) continue;
+
+      const isPeelCont = cfg.showPeelChains && edge.isPeelContinuation;
+      const isPeelDiv = cfg.showPeelChains && edge.isPeelOutput;
+      const isCycle = cfg.showCycles && edge.isCycleEdge;
+      const isShortestPath = edge.isShortestPathToSeed;
+
+      ctx.beginPath();
+      ctx.moveTo(src.x, src.y);
+      ctx.lineTo(tgt.x, tgt.y);
+
+      if (isPeelDiv) {
+        ctx.strokeStyle = '#f59e0b';
+        ctx.lineWidth = 2.5;
+        ctx.setLineDash([6, 4]);
+      } else if (isPeelCont) {
+        ctx.strokeStyle = '#fbbf24';
+        ctx.lineWidth = 3;
+        ctx.setLineDash([]);
+      } else if (isCycle) {
+        ctx.strokeStyle = '#c084fc';
+        ctx.lineWidth = 2.5;
+        ctx.setLineDash([4, 4]);
+      } else if (isShortestPath) {
+        ctx.strokeStyle = '#38bdf8';
+        ctx.lineWidth = 2.5;
+        ctx.setLineDash([]);
+      } else {
+        ctx.strokeStyle = 'rgba(71, 85, 105, 0.55)';
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([]);
+      }
+
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Draw Arrow Head
+      drawArrowHead(ctx, src.x, src.y, tgt.x, tgt.y, tgt.radius, ctx.strokeStyle as string);
+
+      // Draw Edge Label (Amount)
+      const isConnectedToSelected =
+        cfg.selectedNodeId && (src.id === cfg.selectedNodeId || tgt.id === cfg.selectedNodeId);
+      if (isConnectedToSelected || isPeelDiv || isPeelCont) {
+        const midX = (src.x + tgt.x) / 2;
+        const midY = (src.y + tgt.y) / 2;
+
+        ctx.fillStyle = isPeelDiv ? '#fef3c7' : '#cbd5e1';
+        ctx.font = '10px "JetBrains Mono", monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText(`${edge.amount} ${cfg.currency}`, midX, midY - 6);
+
+        if (isPeelDiv) {
+          ctx.fillStyle = '#f59e0b';
+          ctx.font = 'bold 9px "Plus Jakarta Sans", sans-serif';
+          ctx.fillText('PEEL', midX, midY + 10);
+        }
+      }
+    }
+
+    // Draw Nodes
+    for (const node of simNodesRef.current) {
+      const isSelected = cfg.selectedNodeId === node.id;
+      const isHovered = hoveredNodeIdRef.current === node.id;
+
+      // Outer selection / seed / hover halo
+      if (isSelected) {
+        ctx.beginPath();
+        ctx.arc(node.x, node.y, node.radius + 9, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(34, 211, 238, 0.24)';
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(34, 211, 238, 0.7)';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+      } else if (isHovered) {
+        ctx.beginPath();
+        ctx.arc(node.x, node.y, node.radius + 7, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(148, 163, 184, 0.18)';
+        ctx.fill();
+      } else if (node.isIllicitSeed) {
+        ctx.beginPath();
+        ctx.arc(node.x, node.y, node.radius + 8, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(239, 68, 68, 0.2)';
+        ctx.fill();
+      }
+
+      // Node Body Circle
+      ctx.beginPath();
+      ctx.arc(node.x, node.y, node.radius, 0, Math.PI * 2);
+
+      const color = getNodeColor(node, cfg.showHeatmap);
+      ctx.fillStyle = color.bg;
+      ctx.fill();
+
+      ctx.strokeStyle = isSelected ? '#22d3ee' : isHovered ? '#e2e8f0' : color.border;
+      ctx.lineWidth = isSelected ? 3 : isHovered ? 2.5 : 2;
+      ctx.stroke();
+
+      // Node Label
+      ctx.font = node.isIllicitSeed
+        ? 'bold 11px "Plus Jakarta Sans", sans-serif'
+        : '11px "JetBrains Mono", monospace';
+      ctx.textAlign = 'center';
+      ctx.fillStyle = isSelected ? '#22d3ee' : isHovered ? '#ffffff' : '#e2e8f0';
+
+      const displayLabel = node.isIllicitSeed ? 'ILLICIT SEED' : truncateAddress(node.id);
+      ctx.fillText(displayLabel, node.x, node.y + node.radius + 14);
+
+      // Score or Hop tag below
+      ctx.font = '10px "JetBrains Mono", monospace';
+      ctx.fillStyle = isSelected ? '#67e8f9' : '#94a3b8';
+      const meta = node.isIllicitSeed
+        ? 'Hop 0 · D=100'
+        : isFinite(node.hopDistance)
+        ? `Hop ${node.hopDistance} · D=${node.proximityScore}`
+        : 'Clean';
+      ctx.fillText(meta, node.x, node.y + node.radius + 26);
+    }
+
+    ctx.restore();
+    ctx.restore();
+  }, []);
+
+  // Keep canvas crisp and matched to actual container size via ResizeObserver
+  useEffect(() => {
+    const container = containerRef.current;
+    const canvas = canvasRef.current;
+    if (!container || !canvas) return;
+
+    const updateCanvasSize = () => {
+      const rect = container.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return;
+
+      const dpr = window.devicePixelRatio || 1;
+      sizeRef.current = { width: rect.width, height: rect.height };
+      canvas.width = Math.round(rect.width * dpr);
+      canvas.height = Math.round(rect.height * dpr);
+      renderCanvas();
+    };
+
+    updateCanvasSize();
+    const observer = new ResizeObserver(updateCanvasSize);
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, [renderCanvas]);
+
+  // Fit graph nicely inside viewport
+  const fitGraphToView = useCallback(() => {
+    const simNodes = simNodesRef.current;
+    const { width, height } = sizeRef.current;
+    if (simNodes.length === 0 || width <= 0 || height <= 0) {
+      transformRef.current = { x: 0, y: 0, k: 1 };
+      setZoomPercent(100);
+      renderCanvas();
+      return;
+    }
+
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (const n of simNodes) {
+      if (n.x < minX) minX = n.x;
+      if (n.x > maxX) maxX = n.x;
+      if (n.y < minY) minY = n.y;
+      if (n.y > maxY) maxY = n.y;
+    }
+
+    const padding = 90;
+    const graphW = Math.max(200, maxX - minX + padding * 2);
+    const graphH = Math.max(200, maxY - minY + padding * 2);
+    const scale = Math.max(0.45, Math.min(1.25, Math.min(width / graphW, height / graphH)));
+
+    const centerX = (minX + maxX) / 2;
+    const centerY = (minY + maxY) / 2;
+
+    transformRef.current = {
+      k: scale,
+      x: width / 2 - centerX * scale,
+      y: height / 2 - centerY * scale,
+    };
+    setZoomPercent(Math.round(scale * 100));
+    renderCanvas();
+  }, [renderCanvas]);
+
+  // Initialize simulation positions ONLY when nodes change
+  useEffect(() => {
+    const { width, height } = sizeRef.current;
+
     const newSimNodes: SimNode[] = nodes.map((n, i) => {
       const existing = simNodesRef.current.find((s) => s.id === n.id);
       if (existing) {
         return { ...n, x: existing.x, y: existing.y, vx: 0, vy: 0, radius: getNodeRadius(n) };
       }
 
-      // Initial layout guided by hop distance
       const hops = isFinite(n.hopDistance) ? n.hopDistance : 4;
       const angle = (i / Math.max(1, nodes.length)) * Math.PI * 2;
-      const radiusDist = 80 + hops * 85;
+      const radiusDist = 75 + hops * 75;
 
       return {
         ...n,
-        x: width / 2 + Math.cos(angle) * radiusDist + (Math.random() - 0.5) * 40,
-        y: height / 2 + Math.sin(angle) * radiusDist + (Math.random() - 0.5) * 40,
+        x: width / 2 + Math.cos(angle) * radiusDist + (Math.random() - 0.5) * 35,
+        y: height / 2 + Math.sin(angle) * radiusDist + (Math.random() - 0.5) * 35,
         vx: 0,
         vy: 0,
         radius: getNodeRadius(n),
@@ -91,29 +339,26 @@ export const ForensicsCanvas: React.FC<ForensicsCanvasProps> = ({
     });
 
     simNodesRef.current = newSimNodes;
+    transformRef.current = { x: 0, y: 0, k: 1 };
+    setZoomPercent(100);
   }, [nodes]);
 
-  function getNodeRadius(node: GraphNode): number {
-    if (node.isIllicitSeed) return 22;
-    const vol = Math.max(0.1, node.totalInflow + node.totalOutflow);
-    return Math.min(20, Math.max(12, 10 + Math.log10(vol + 1) * 3));
-  }
-
-  // Physics Simulation Step
+  // Physics Simulation Loop — ONLY runs when nodes or edges change (never restarts on pan/zoom/click!)
   useEffect(() => {
+    if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+
     let iteration = 0;
-    const maxIterations = 200;
+    const maxIterations = 180;
 
     const runPhysics = () => {
       const simNodes = simNodesRef.current;
       if (simNodes.length === 0) return;
 
-      const kAttract = 0.04;
-      const kRepel = 1800;
+      const kAttract = 0.045;
+      const kRepel = 2200;
       const centerPull = 0.008;
       const damping = 0.82;
-      const width = 1000;
-      const height = 650;
+      const { width, height } = sizeRef.current;
 
       // 1. Node Repulsion
       for (let i = 0; i < simNodes.length; i++) {
@@ -125,7 +370,7 @@ export const ForensicsCanvas: React.FC<ForensicsCanvasProps> = ({
           const distSq = dx * dx + dy * dy + 1;
           const dist = Math.sqrt(distSq);
 
-          if (dist < 350) {
+          if (dist < 380) {
             const force = kRepel / distSq;
             const fx = (dx / dist) * force;
             const fy = (dy / dist) * force;
@@ -153,7 +398,7 @@ export const ForensicsCanvas: React.FC<ForensicsCanvasProps> = ({
           const dx = tgt.x - src.x;
           const dy = tgt.y - src.y;
           const dist = Math.sqrt(dx * dx + dy * dy) || 1;
-          const desiredDist = 110;
+          const desiredDist = 120;
           const force = (dist - desiredDist) * kAttract;
           const fx = (dx / dist) * force;
           const fy = (dy / dist) * force;
@@ -185,388 +430,201 @@ export const ForensicsCanvas: React.FC<ForensicsCanvasProps> = ({
       renderCanvas();
 
       iteration++;
-      if (iteration < maxIterations || draggedNodeRef.current) {
+      if (iteration < maxIterations) {
         animFrameRef.current = requestAnimationFrame(runPhysics);
+      } else {
+        animFrameRef.current = null;
       }
     };
 
     animFrameRef.current = requestAnimationFrame(runPhysics);
 
     return () => {
-      if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+      if (animFrameRef.current) {
+        cancelAnimationFrame(animFrameRef.current);
+        animFrameRef.current = null;
+      }
     };
-  }, [nodes, edges, transform, showPeelChains, showCycles, showHeatmap, groupByEntity, selectedNodeId, hoveredNode]);
+  }, [nodes, edges, renderCanvas]);
 
-  // Canvas Render Loop
-  const renderCanvas = useCallback(() => {
+  // Re-render immediately whenever visual overlay toggles or selected node changes
+  useEffect(() => {
+    renderCanvas();
+  }, [selectedNodeId, showPeelChains, showCycles, showHeatmap, groupByEntity, renderCanvas]);
+
+  // Attach native non-passive wheel listener for smooth zoom toward cursor
+  useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
 
-    const width = canvas.width;
-    const height = canvas.height;
+    const handleNativeWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      const tf = transformRef.current;
 
-    ctx.save();
-    ctx.clearRect(0, 0, width, height);
+      const zoomFactor = e.deltaY < 0 ? 1.12 : 0.89;
+      const newK = Math.max(0.25, Math.min(4.0, tf.k * zoomFactor));
 
-    // Apply viewport transform (pan & zoom)
-    ctx.translate(transform.x, transform.y);
-    ctx.scale(transform.k, transform.k);
+      const mouseX = e.clientX - rect.left;
+      const mouseY = e.clientY - rect.top;
 
-    // Draw Subtle Grid
-    drawGrid(ctx, width, height, transform);
+      transformRef.current = {
+        k: newK,
+        x: mouseX - (mouseX - tf.x) * (newK / tf.k),
+        y: mouseY - (mouseY - tf.y) * (newK / tf.k),
+      };
+      setZoomPercent(Math.round(newK * 100));
+      renderCanvas();
+    };
 
-    const nodeMap = new Map<string, SimNode>();
-    for (const sn of simNodesRef.current) nodeMap.set(sn.id, sn);
+    canvas.addEventListener('wheel', handleNativeWheel, { passive: false });
+    return () => canvas.removeEventListener('wheel', handleNativeWheel);
+  }, [renderCanvas]);
 
-    // Draw Entity Clusters Hull if toggled
-    if (groupByEntity) {
-      drawEntityHulls(ctx, simNodesRef.current);
-    }
-
-    // Draw Edges
-    for (const edge of edges) {
-      const src = nodeMap.get(edge.source);
-      const tgt = nodeMap.get(edge.target);
-      if (!src || !tgt) continue;
-
-      const isPeelCont = showPeelChains && edge.isPeelContinuation;
-      const isPeelDiv = showPeelChains && edge.isPeelOutput;
-      const isCycle = showCycles && edge.isCycleEdge;
-      const isShortestPath = edge.isShortestPathToSeed;
-
-      ctx.beginPath();
-      ctx.moveTo(src.x, src.y);
-      ctx.lineTo(tgt.x, tgt.y);
-
-      if (isPeelDiv) {
-        // Diverted peel: amber dashed line
-        ctx.strokeStyle = '#f59e0b';
-        ctx.lineWidth = 2.5;
-        ctx.setLineDash([6, 4]);
-      } else if (isPeelCont) {
-        // Continuation peel: solid bright amber
-        ctx.strokeStyle = '#fbbf24';
-        ctx.lineWidth = 3;
-        ctx.setLineDash([]);
-      } else if (isCycle) {
-        // Cycle: vibrant violet dashed
-        ctx.strokeStyle = '#c084fc';
-        ctx.lineWidth = 2.5;
-        ctx.setLineDash([4, 4]);
-      } else if (isShortestPath) {
-        // Shortest path: cyan
-        ctx.strokeStyle = '#38bdf8';
-        ctx.lineWidth = 2.5;
-        ctx.setLineDash([]);
-      } else {
-        ctx.strokeStyle = 'rgba(71, 85, 105, 0.45)';
-        ctx.lineWidth = 1.5;
-        ctx.setLineDash([]);
-      }
-
-      ctx.stroke();
-      ctx.setLineDash([]);
-
-      // Draw Arrow Head
-      drawArrowHead(ctx, src.x, src.y, tgt.x, tgt.y, tgt.radius, ctx.strokeStyle as string);
-
-      // Draw Edge Label (Amount) if selected or hovered
-      const isConnectedToSelected = selectedNodeId && (src.id === selectedNodeId || tgt.id === selectedNodeId);
-      if (isConnectedToSelected || isPeelDiv || isPeelCont) {
-        const midX = (src.x + tgt.x) / 2;
-        const midY = (src.y + tgt.y) / 2;
-
-        ctx.fillStyle = isPeelDiv ? '#fef3c7' : '#94a3b8';
-        ctx.font = '10px "JetBrains Mono", monospace';
-        ctx.textAlign = 'center';
-        ctx.fillText(`${edge.amount} ${currency}`, midX, midY - 6);
-
-        if (isPeelDiv) {
-          ctx.fillStyle = '#f59e0b';
-          ctx.font = 'bold 9px "Plus Jakarta Sans", sans-serif';
-          ctx.fillText('PEEL', midX, midY + 10);
-        }
-      }
-    }
-
-    // Draw Nodes
-    for (const node of simNodesRef.current) {
-      const isSelected = selectedNodeId === node.id;
-      const isHovered = hoveredNode?.id === node.id;
-
-      // Outer glow for illicit seed or selected node
-      if (node.isIllicitSeed) {
-        ctx.beginPath();
-        ctx.arc(node.x, node.y, node.radius + 8, 0, Math.PI * 2);
-        ctx.fillStyle = 'rgba(239, 68, 68, 0.2)';
-        ctx.fill();
-      } else if (isSelected) {
-        ctx.beginPath();
-        ctx.arc(node.x, node.y, node.radius + 6, 0, Math.PI * 2);
-        ctx.fillStyle = 'rgba(56, 189, 248, 0.25)';
-        ctx.fill();
-      }
-
-      // Node Body Circle
-      ctx.beginPath();
-      ctx.arc(node.x, node.y, node.radius, 0, Math.PI * 2);
-
-      const color = getNodeColor(node, showHeatmap);
-      ctx.fillStyle = color.bg;
-      ctx.fill();
-
-      ctx.strokeStyle = isSelected ? '#38bdf8' : color.border;
-      ctx.lineWidth = isSelected ? 3 : 2;
-      ctx.stroke();
-
-      // Node Label
-      ctx.font = node.isIllicitSeed
-        ? 'bold 11px "Plus Jakarta Sans", sans-serif'
-        : '11px "JetBrains Mono", monospace';
-      ctx.textAlign = 'center';
-      ctx.fillStyle = isSelected ? '#38bdf8' : '#e2e8f0';
-
-      const displayLabel = node.isIllicitSeed ? 'ILLICIT SEED' : truncateAddress(node.id);
-      ctx.fillText(displayLabel, node.x, node.y + node.radius + 14);
-
-      // Score or Hop tag below
-      ctx.font = '10px "JetBrains Mono", monospace';
-      ctx.fillStyle = '#94a3b8';
-      const meta = node.isIllicitSeed ? 'Hop 0 · D=100' : isFinite(node.hopDistance) ? `Hop ${node.hopDistance} · D=${node.proximityScore}` : 'Clean';
-      ctx.fillText(meta, node.x, node.y + node.radius + 26);
-    }
-
-    ctx.restore();
-  }, [transform, showPeelChains, showCycles, showHeatmap, groupByEntity, selectedNodeId, hoveredNode, edges, currency]);
-
-  function getNodeColor(node: GraphNode, heatmap: boolean): { bg: string; border: string } {
-    if (node.isIllicitSeed) {
-      return { bg: '#450a0a', border: '#ef4444' };
-    }
-
-    if (heatmap) {
-      const score = node.proximityScore;
-      if (score >= 50) return { bg: '#7c2d12', border: '#f97316' };
-      if (score >= 25) return { bg: '#78350f', border: '#f59e0b' };
-      if (score >= 12.5) return { bg: '#713f12', border: '#eab308' };
-      if (score > 0) return { bg: '#0c4a6e', border: '#38bdf8' };
-      return { bg: '#064e3b', border: '#10b981' };
-    }
-
-    switch (node.riskCategory) {
-      case 'CRITICAL_ILLICIT_SEED':
-        return { bg: '#450a0a', border: '#ef4444' };
-      case 'HIGH_TAINT_PROXIMAL':
-        return { bg: '#7c2d12', border: '#ea580c' };
-      case 'ELEVATED_RISK_TRANSIT':
-        return { bg: '#78350f', border: '#f59e0b' };
-      case 'MONITORED_HOPS':
-        return { bg: '#713f12', border: '#eab308' };
-      case 'LOW_PROXIMITY':
-        return { bg: '#0c4a6e', border: '#38bdf8' };
-      default:
-        return { bg: '#0f172a', border: '#475569' };
-    }
-  }
-
-  function drawGrid(
-    ctx: CanvasRenderingContext2D,
-    w: number,
-    h: number,
-    tf: { x: number; y: number; k: number }
-  ) {
-    const gridSize = 40;
-    ctx.strokeStyle = 'rgba(30, 41, 59, 0.4)';
-    ctx.lineWidth = 1;
-
-    const startX = -tf.x / tf.k;
-    const startY = -tf.y / tf.k;
-    const endX = (w - tf.x) / tf.k;
-    const endY = (h - tf.y) / tf.k;
-
-    ctx.beginPath();
-    for (let x = Math.floor(startX / gridSize) * gridSize; x < endX; x += gridSize) {
-      ctx.moveTo(x, startY);
-      ctx.lineTo(x, endY);
-    }
-    for (let y = Math.floor(startY / gridSize) * gridSize; y < endY; y += gridSize) {
-      ctx.moveTo(startX, y);
-      ctx.lineTo(endX, y);
-    }
-    ctx.stroke();
-  }
-
-  function drawArrowHead(
-    ctx: CanvasRenderingContext2D,
-    x1: number,
-    y1: number,
-    x2: number,
-    y2: number,
-    targetRadius: number,
-    color: string
-  ) {
-    const angle = Math.atan2(y2 - y1, x2 - x1);
-    const arrowLength = 9;
-    const arrowWidth = 5;
-
-    // Offset arrow head to touch outer perimeter of target node
-    const endX = x2 - Math.cos(angle) * (targetRadius + 3);
-    const endY = y2 - Math.sin(angle) * (targetRadius + 3);
-
-    ctx.save();
-    ctx.beginPath();
-    ctx.moveTo(endX, endY);
-    ctx.lineTo(
-      endX - arrowLength * Math.cos(angle - Math.PI / 7),
-      endY - arrowLength * Math.sin(angle - Math.PI / 7)
-    );
-    ctx.lineTo(
-      endX - arrowLength * Math.cos(angle + Math.PI / 7),
-      endY - arrowLength * Math.sin(angle + Math.PI / 7)
-    );
-    ctx.closePath();
-    ctx.fillStyle = color;
-    ctx.fill();
-    ctx.restore();
-  }
-
-  function drawEntityHulls(ctx: CanvasRenderingContext2D, simNodes: SimNode[]) {
-    const clusterMap = new Map<string, SimNode[]>();
-    for (const n of simNodes) {
-      if (!clusterMap.has(n.entityId)) clusterMap.set(n.entityId, []);
-      clusterMap.get(n.entityId)!.push(n);
-    }
-
-    ctx.save();
-    for (const [entityId, group] of clusterMap.entries()) {
-      if (group.length > 1) {
-        // Calculate bounding center & radius
-        let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-        for (const n of group) {
-          if (n.x < minX) minX = n.x;
-          if (n.x > maxX) maxX = n.x;
-          if (n.y < minY) minY = n.y;
-          if (n.y > maxY) maxY = n.y;
-        }
-
-        const padding = 28;
-        ctx.fillStyle = 'rgba(56, 189, 248, 0.06)';
-        ctx.strokeStyle = 'rgba(56, 189, 248, 0.3)';
-        ctx.lineWidth = 1;
-        ctx.setLineDash([5, 5]);
-
-        const rw = maxX - minX + padding * 2;
-        const rh = maxY - minY + padding * 2;
-        ctx.beginPath();
-        ctx.roundRect(minX - padding, minY - padding, rw, rh, 12);
-        ctx.fill();
-        ctx.stroke();
-
-        ctx.font = '10px "JetBrains Mono", monospace';
-        ctx.fillStyle = 'rgba(148, 163, 184, 0.8)';
-        ctx.fillText(`Cluster: ${entityId}`, minX - padding + 8, minY - padding + 14);
-      }
-    }
-    ctx.restore();
-  }
-
-  // Mouse Interaction Handlers
-  const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+  // Helper: Convert pointer event coordinates to world coordinates
+  const getWorldCoords = (clientX: number, clientY: number) => {
     const canvas = canvasRef.current;
-    if (!canvas) return;
+    if (!canvas) return { x: 0, y: 0 };
     const rect = canvas.getBoundingClientRect();
-    const mouseX = (e.clientX - rect.left - transform.x) / transform.k;
-    const mouseY = (e.clientY - rect.top - transform.y) / transform.k;
+    const tf = transformRef.current;
+    return {
+      x: (clientX - rect.left - tf.x) / tf.k,
+      y: (clientY - rect.top - tf.y) / tf.k,
+    };
+  };
 
-    // Check if clicked on a node
-    const clickedNode = simNodesRef.current.find((n) => {
-      const dist = Math.hypot(n.x - mouseX, n.y - mouseY);
-      return dist <= n.radius + 4;
-    });
+  // Hit-test nodes in reverse order (top-most drawn node wins)
+  const findNodeAt = (worldX: number, worldY: number): SimNode | undefined => {
+    const simNodes = simNodesRef.current;
+    const hitPadding = Math.max(8, 10 / transformRef.current.k);
+    for (let i = simNodes.length - 1; i >= 0; i--) {
+      const n = simNodes[i];
+      const dist = Math.hypot(n.x - worldX, n.y - worldY);
+      if (dist <= n.radius + hitPadding) {
+        return n;
+      }
+    }
+    return undefined;
+  };
+
+  // Pointer Interaction Handlers (PointerCapture ensures dragging never gets stuck)
+  const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    canvas.setPointerCapture(e.pointerId);
+
+    pointerDownPosRef.current = { x: e.clientX, y: e.clientY };
+    const world = getWorldCoords(e.clientX, e.clientY);
+    const clickedNode = findNodeAt(world.x, world.y);
 
     if (clickedNode) {
       draggedNodeRef.current = clickedNode;
+      hoveredNodeIdRef.current = clickedNode.id;
+      setHoveredNodeInfo(clickedNode);
+      setCursorStyle('grabbing');
       onSelectNode(clickedNode.id);
+      renderCanvas();
     } else {
-      isDraggingRef.current = true;
-      dragStartRef.current = { x: e.clientX - transform.x, y: e.clientY - transform.y };
-      onSelectNode(null);
+      isPanningRef.current = true;
+      panStartRef.current = {
+        x: e.clientX - transformRef.current.x,
+        y: e.clientY - transformRef.current.y,
+      };
+      setCursorStyle('grabbing');
     }
   };
 
-  const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
-    const mouseX = (e.clientX - rect.left - transform.x) / transform.k;
-    const mouseY = (e.clientY - rect.top - transform.y) / transform.k;
-
+  const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (draggedNodeRef.current) {
-      draggedNodeRef.current.x = mouseX;
-      draggedNodeRef.current.y = mouseY;
+      const world = getWorldCoords(e.clientX, e.clientY);
+      draggedNodeRef.current.x = world.x;
+      draggedNodeRef.current.y = world.y;
       draggedNodeRef.current.vx = 0;
       draggedNodeRef.current.vy = 0;
       renderCanvas();
       return;
     }
 
-    if (isDraggingRef.current) {
-      setTransform((prev) => ({
-        ...prev,
-        x: e.clientX - dragStartRef.current.x,
-        y: e.clientY - dragStartRef.current.y,
-      }));
+    if (isPanningRef.current) {
+      transformRef.current = {
+        ...transformRef.current,
+        x: e.clientX - panStartRef.current.x,
+        y: e.clientY - panStartRef.current.y,
+      };
+      renderCanvas();
       return;
     }
 
     // Hover detection
-    const hovered = simNodesRef.current.find((n) => {
-      const dist = Math.hypot(n.x - mouseX, n.y - mouseY);
-      return dist <= n.radius + 4;
-    });
-    setHoveredNode(hovered || null);
+    const world = getWorldCoords(e.clientX, e.clientY);
+    const hovered = findNodeAt(world.x, world.y);
+    const nextHoverId = hovered ? hovered.id : null;
+
+    if (hoveredNodeIdRef.current !== nextHoverId) {
+      hoveredNodeIdRef.current = nextHoverId;
+      setHoveredNodeInfo(hovered || null);
+      setCursorStyle(hovered ? 'pointer' : 'grab');
+      renderCanvas();
+    }
   };
 
-  const handleMouseUp = () => {
-    draggedNodeRef.current = null;
-    isDraggingRef.current = false;
-  };
-
-  const handleWheel = (e: React.WheelEvent<HTMLCanvasElement>) => {
-    e.preventDefault();
+  const handlePointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
-    if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
+    if (canvas && canvas.hasPointerCapture(e.pointerId)) {
+      canvas.releasePointerCapture(e.pointerId);
+    }
 
-    const zoomFactor = e.deltaY < 0 ? 1.12 : 0.89;
-    const newK = Math.max(0.3, Math.min(3.5, transform.k * zoomFactor));
+    const wasPanning = isPanningRef.current;
+    const movedDist = Math.hypot(
+      e.clientX - pointerDownPosRef.current.x,
+      e.clientY - pointerDownPosRef.current.y
+    );
 
-    const mouseX = e.clientX - rect.left;
-    const mouseY = e.clientY - rect.top;
+    draggedNodeRef.current = null;
+    isPanningRef.current = false;
 
-    setTransform((prev) => ({
+    // Only clear selection on an explicit stationary click on empty canvas (not after panning)
+    if (wasPanning && movedDist < 4) {
+      const world = getWorldCoords(e.clientX, e.clientY);
+      const hit = findNodeAt(world.x, world.y);
+      if (hit) {
+        onSelectNode(hit.id);
+      }
+    }
+
+    const world = getWorldCoords(e.clientX, e.clientY);
+    const overNode = findNodeAt(world.x, world.y);
+    setCursorStyle(overNode ? 'pointer' : 'grab');
+    renderCanvas();
+  };
+
+  const zoomAtCenter = (factor: number) => {
+    const { width, height } = sizeRef.current;
+    const tf = transformRef.current;
+    const newK = Math.max(0.25, Math.min(4.0, tf.k * factor));
+    const cx = width / 2;
+    const cy = height / 2;
+
+    transformRef.current = {
       k: newK,
-      x: mouseX - (mouseX - prev.x) * (newK / prev.k),
-      y: mouseY - (mouseY - prev.y) * (newK / prev.k),
-    }));
+      x: cx - (cx - tf.x) * (newK / tf.k),
+      y: cy - (cy - tf.y) * (newK / tf.k),
+    };
+    setZoomPercent(Math.round(newK * 100));
+    renderCanvas();
   };
 
   const resetView = () => {
-    setTransform({ x: 0, y: 0, k: 1 });
-  };
-
-  const zoomIn = () => {
-    setTransform((prev) => ({ ...prev, k: Math.min(3.5, prev.k * 1.2) }));
-  };
-
-  const zoomOut = () => {
-    setTransform((prev) => ({ ...prev, k: Math.max(0.3, prev.k * 0.83) }));
+    transformRef.current = { x: 0, y: 0, k: 1 };
+    setZoomPercent(100);
+    renderCanvas();
   };
 
   return (
-    <div className="relative w-full h-full bg-slate-950 overflow-hidden select-none border border-slate-800 rounded-lg flex flex-col">
+    <div
+      ref={containerRef}
+      className="relative w-full h-full bg-slate-950 overflow-hidden select-none border border-slate-800 rounded-lg flex flex-col"
+    >
       {/* Top Overlay Toolbar */}
       <div className="absolute top-3 left-3 right-3 z-10 flex items-center justify-between gap-3 pointer-events-none">
         {/* Toggle Overlays */}
@@ -627,18 +685,28 @@ export const ForensicsCanvas: React.FC<ForensicsCanvasProps> = ({
         {/* Zoom & Viewport Controls */}
         <div className="flex items-center gap-1 p-1 bg-slate-900/90 backdrop-blur-md rounded-lg border border-slate-800 pointer-events-auto">
           <button
-            onClick={zoomIn}
+            onClick={() => zoomAtCenter(1.2)}
             className="p-1.5 text-slate-400 hover:text-slate-100 rounded hover:bg-slate-800 transition-colors"
             title="Zoom In"
           >
             <ZoomIn className="w-4 h-4" />
           </button>
+          <span className="text-[11px] font-mono text-slate-400 px-1.5 min-w-[44px] text-center tabular-nums">
+            {zoomPercent}%
+          </span>
           <button
-            onClick={zoomOut}
+            onClick={() => zoomAtCenter(0.83)}
             className="p-1.5 text-slate-400 hover:text-slate-100 rounded hover:bg-slate-800 transition-colors"
             title="Zoom Out"
           >
             <ZoomOut className="w-4 h-4" />
+          </button>
+          <button
+            onClick={fitGraphToView}
+            className="p-1.5 text-slate-400 hover:text-slate-100 rounded hover:bg-slate-800 transition-colors"
+            title="Fit Graph to Screen"
+          >
+            <Maximize2 className="w-4 h-4" />
           </button>
           <button
             onClick={resetView}
@@ -653,18 +721,31 @@ export const ForensicsCanvas: React.FC<ForensicsCanvasProps> = ({
       {/* Main Canvas Viewport */}
       <canvas
         ref={canvasRef}
-        width={1100}
-        height={650}
-        onMouseDown={handleMouseDown}
-        onMouseMove={handleMouseMove}
-        onMouseUp={handleMouseUp}
-        onMouseLeave={handleMouseUp}
-        onWheel={handleWheel}
-        className="w-full h-full cursor-grab active:cursor-grabbing block"
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerUp}
+        style={{ cursor: cursorStyle, touchAction: 'none' }}
+        className="w-full h-full block"
       />
 
+      {/* Hovered Node Quick Pill */}
+      {hoveredNodeInfo && (
+        <div className="absolute bottom-3 right-3 z-10 px-3 py-2 bg-slate-900/95 backdrop-blur-md rounded-lg border border-slate-700 text-xs font-mono text-slate-200 pointer-events-none shadow-lg">
+          <div className="text-[10px] text-cyan-400 font-semibold">
+            {hoveredNodeInfo.entityId} · Click to inspect
+          </div>
+          <div className="mt-0.5 text-slate-100">{truncateAddress(hoveredNodeInfo.id)}</div>
+          <div className="text-[10px] text-slate-400 mt-0.5">
+            {isFinite(hoveredNodeInfo.hopDistance)
+              ? `Hop ${hoveredNodeInfo.hopDistance} · D(v,E) = ${hoveredNodeInfo.proximityScore}`
+              : 'Unexposed'}
+          </div>
+        </div>
+      )}
+
       {/* Bottom Legend */}
-      <div className="absolute bottom-3 left-3 z-10 flex items-center gap-4 px-3 py-1.5 bg-slate-900/90 backdrop-blur-md rounded-lg border border-slate-800 text-xs text-slate-400">
+      <div className="absolute bottom-3 left-3 z-10 flex items-center gap-4 px-3 py-1.5 bg-slate-900/90 backdrop-blur-md rounded-lg border border-slate-800 text-xs text-slate-400 pointer-events-none">
         <div className="flex items-center gap-1.5">
           <span className="w-2.5 h-2.5 rounded-full bg-red-500 inline-block" />
           <span className="text-slate-300">Illicit Seed (Hop 0)</span>
@@ -689,3 +770,131 @@ export const ForensicsCanvas: React.FC<ForensicsCanvasProps> = ({
     </div>
   );
 };
+
+function getNodeColor(node: GraphNode, heatmap: boolean): { bg: string; border: string } {
+  if (node.isIllicitSeed) {
+    return { bg: '#450a0a', border: '#ef4444' };
+  }
+
+  if (heatmap) {
+    const score = node.proximityScore;
+    if (score >= 50) return { bg: '#7c2d12', border: '#f97316' };
+    if (score >= 25) return { bg: '#78350f', border: '#f59e0b' };
+    if (score >= 12.5) return { bg: '#713f12', border: '#eab308' };
+    if (score > 0) return { bg: '#0c4a6e', border: '#38bdf8' };
+    return { bg: '#064e3b', border: '#10b981' };
+  }
+
+  switch (node.riskCategory) {
+    case 'CRITICAL_ILLICIT_SEED':
+      return { bg: '#450a0a', border: '#ef4444' };
+    case 'HIGH_TAINT_PROXIMAL':
+      return { bg: '#7c2d12', border: '#ea580c' };
+    case 'ELEVATED_RISK_TRANSIT':
+      return { bg: '#78350f', border: '#f59e0b' };
+    case 'MONITORED_HOPS':
+      return { bg: '#713f12', border: '#eab308' };
+    case 'LOW_PROXIMITY':
+      return { bg: '#0c4a6e', border: '#38bdf8' };
+    default:
+      return { bg: '#0f172a', border: '#475569' };
+  }
+}
+
+function drawGrid(
+  ctx: CanvasRenderingContext2D,
+  w: number,
+  h: number,
+  tf: { x: number; y: number; k: number }
+) {
+  const gridSize = 40;
+  ctx.strokeStyle = 'rgba(30, 41, 59, 0.4)';
+  ctx.lineWidth = 1 / tf.k;
+
+  const startX = -tf.x / tf.k;
+  const startY = -tf.y / tf.k;
+  const endX = (w - tf.x) / tf.k;
+  const endY = (h - tf.y) / tf.k;
+
+  ctx.beginPath();
+  for (let x = Math.floor(startX / gridSize) * gridSize; x < endX; x += gridSize) {
+    ctx.moveTo(x, startY);
+    ctx.lineTo(x, endY);
+  }
+  for (let y = Math.floor(startY / gridSize) * gridSize; y < endY; y += gridSize) {
+    ctx.moveTo(startX, y);
+    ctx.lineTo(endX, y);
+  }
+  ctx.stroke();
+}
+
+function drawArrowHead(
+  ctx: CanvasRenderingContext2D,
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number,
+  targetRadius: number,
+  color: string
+) {
+  const angle = Math.atan2(y2 - y1, x2 - x1);
+  const arrowLength = 9;
+
+  const endX = x2 - Math.cos(angle) * (targetRadius + 3);
+  const endY = y2 - Math.sin(angle) * (targetRadius + 3);
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(endX, endY);
+  ctx.lineTo(
+    endX - arrowLength * Math.cos(angle - Math.PI / 7),
+    endY - arrowLength * Math.sin(angle - Math.PI / 7)
+  );
+  ctx.lineTo(
+    endX - arrowLength * Math.cos(angle + Math.PI / 7),
+    endY - arrowLength * Math.sin(angle + Math.PI / 7)
+  );
+  ctx.closePath();
+  ctx.fillStyle = color;
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawEntityHulls(ctx: CanvasRenderingContext2D, simNodes: SimNode[]) {
+  const clusterMap = new Map<string, SimNode[]>();
+  for (const n of simNodes) {
+    if (!clusterMap.has(n.entityId)) clusterMap.set(n.entityId, []);
+    clusterMap.get(n.entityId)!.push(n);
+  }
+
+  ctx.save();
+  for (const [entityId, group] of clusterMap.entries()) {
+    if (group.length > 1) {
+      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+      for (const n of group) {
+        if (n.x < minX) minX = n.x;
+        if (n.x > maxX) maxX = n.x;
+        if (n.y < minY) minY = n.y;
+        if (n.y > maxY) maxY = n.y;
+      }
+
+      const padding = 28;
+      ctx.fillStyle = 'rgba(56, 189, 248, 0.06)';
+      ctx.strokeStyle = 'rgba(56, 189, 248, 0.3)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([5, 5]);
+
+      const rw = maxX - minX + padding * 2;
+      const rh = maxY - minY + padding * 2;
+      ctx.beginPath();
+      ctx.roundRect(minX - padding, minY - padding, rw, rh, 12);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.font = '10px "JetBrains Mono", monospace';
+      ctx.fillStyle = 'rgba(148, 163, 184, 0.8)';
+      ctx.fillText(`Cluster: ${entityId}`, minX - padding + 8, minY - padding + 14);
+    }
+  }
+  ctx.restore();
+}

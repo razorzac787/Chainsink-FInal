@@ -17,7 +17,7 @@ import {
   GraphNode,
   GraphEdge,
 } from './types/forensics';
-import { ShieldAlert, AlertTriangle, Layers, GitFork, ArrowUpRight } from 'lucide-react';
+import { Download } from 'lucide-react';
 
 export default function App() {
   // Master Forensic Engine
@@ -114,6 +114,15 @@ export default function App() {
           <span className="text-emerald-400 flex items-center gap-1">
             <span>Merkle Settled</span>
           </span>
+          <span className="text-slate-700">|</span>
+          <a
+            href="/ChainSink_CSD436_Mohammad_Zaki.pptx"
+            download="ChainSink_CSD436_Mohammad_Zaki.pptx"
+            className="flex items-center gap-1.5 text-cyan-400 hover:text-cyan-300 transition-colors font-sans font-medium whitespace-nowrap"
+          >
+            <Download className="w-3.5 h-3.5" />
+            <span>Download Slides (.pptx)</span>
+          </a>
         </div>
       </div>
 
